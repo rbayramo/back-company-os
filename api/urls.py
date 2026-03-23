@@ -11,6 +11,8 @@ urlpatterns = [
 
     # Messages (conversation with CEO)
     path('projects/<str:project_id>/messages/', views.messages_list, name='messages_list'),
+    path('projects/<str:project_id>/send_message/', views.send_message, name='send_message'),
+    path('projects/<str:project_id>/approve_plan/', views.approve_plan, name='approve_plan'),
 
     # Kanban tickets
     path('projects/<str:project_id>/tickets/', views.tickets_list, name='tickets_list'),

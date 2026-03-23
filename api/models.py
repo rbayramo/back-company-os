@@ -7,12 +7,13 @@ class Project(me.Document):
 
     title = me.StringField(required=True, max_length=200)
     description = me.StringField(default='')
-    status = me.StringField(choices=['active', 'paused', 'completed', 'archived'], default='active')
+    status = me.StringField(choices=['active', 'archived', 'completed'], default='active')
     goal = me.StringField(default='')
     created_at = me.DateTimeField(default=datetime.utcnow)
     updated_at = me.DateTimeField(default=datetime.utcnow)
-    created_by = me.StringField(default='user')
+    created_by = me.StringField(default='anonymous')
     tags = me.ListField(me.StringField())
+    auto_pilot = me.BooleanField(default=False)
 
     def to_dict(self):
         return {
@@ -26,6 +27,7 @@ class Project(me.Document):
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'created_by': self.created_by,
             'tags': self.tags,
+            'auto_pilot': self.auto_pilot,
         }
 
 
@@ -35,8 +37,8 @@ class ConversationMessage(me.Document):
     ]}
 
     project_id = me.StringField(required=True)
-    sender = me.StringField(choices=['human', 'ceo'], required=True)
-    sender_id = me.StringField(default='user')
+    sender = me.StringField(choices=['human', 'agent:ceo'], required=True)
+    sender_id = me.StringField()
     text = me.StringField(required=True)
     timestamp = me.DateTimeField(default=datetime.utcnow)
     attachments = me.ListField(me.StringField())
@@ -61,7 +63,7 @@ class ConversationMessage(me.Document):
 class AgentMessage(me.Document):
     meta = {'collection': 'agent_messages', 'indexes': ['project_id', 'timestamp', 'sender', 'recipient']}
 
-    message_id = me.StringField()
+    message_id = me.StringField(required=True, unique=True)
     timestamp = me.DateTimeField(default=datetime.utcnow)
     message_type = me.StringField()
     sender = me.StringField()
@@ -73,6 +75,7 @@ class AgentMessage(me.Document):
 
     def to_dict(self):
         return {
+            'id': str(self.id),
             '_id': str(self.id),
             'message_id': self.message_id,
             'timestamp': self.timestamp.isoformat() if self.timestamp else None,
@@ -95,20 +98,21 @@ class BudgetField(me.EmbeddedDocument):
 class Ticket(me.Document):
     meta = {'collection': 'tickets', 'indexes': ['project_id', 'status', 'assigned_to', 'priority']}
 
+    id = me.StringField(primary_key=True)
     project_id = me.StringField(required=True)
     goal_ancestry = me.ListField(me.StringField())
     title = me.StringField(required=True)
     description = me.StringField(default='')
+    department = me.StringField()
     status = me.StringField(
-        choices=['draft', 'assigned', 'in_progress', 'completed', 'failed', 'cancelled'],
+        choices=['draft', 'open', 'assigned', 'in_progress', 'audit_pending', 'completed', 'rejected'],
         default='draft'
     )
     priority = me.StringField(choices=['low', 'medium', 'high', 'critical'], default='medium')
     assigned_to = me.StringField()
-    department = me.StringField()
     dependencies = me.ListField(me.StringField())
     budget = me.EmbeddedDocumentField(BudgetField, default=BudgetField)
-    created_by = me.StringField(default='agent:ceo')
+    created_by = me.StringField()
     created_at = me.DateTimeField(default=datetime.utcnow)
     assigned_at = me.DateTimeField()
     completed_at = me.DateTimeField()
@@ -117,31 +121,47 @@ class Ticket(me.Document):
     logs = me.ListField(me.StringField())
     output = me.DictField()
     tags = me.ListField(me.StringField())
+    ticket_type_id = me.StringField()
 
     def to_dict(self):
         return {
-            'id': str(self.id),
-            '_id': str(self.id),
+            'id': self.id,
+            '_id': self.id,
             'project_id': self.project_id,
+            'goal_ancestry': self.goal_ancestry,
             'title': self.title,
             'description': self.description,
             'status': self.status,
             'priority': self.priority,
             'assigned_to': self.assigned_to,
-            'department': self.department,
             'dependencies': self.dependencies,
             'budget': {
                 'allocated': self.budget.allocated if self.budget else 0,
                 'spent': self.budget.spent if self.budget else 0,
                 'remaining': self.budget.remaining if self.budget else 0,
             },
+            'created_by': self.created_by,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'assigned_at': self.assigned_at.isoformat() if self.assigned_at else None,
             'completed_at': self.completed_at.isoformat() if self.completed_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'version': self.version,
-            'tags': self.tags,
+            'logs': self.logs,
             'output': self.output,
+            'tags': self.tags,
+            'ticket_type_id': self.ticket_type_id,
         }
+
+
+class TicketHistory(me.Document):
+    meta = {'collection': 'ticket_history', 'indexes': ['ticket_id']}
+    
+    ticket_id = me.StringField(required=True)
+    version = me.IntField()
+    document = me.DictField()
+    modified_at = me.DateTimeField(default=datetime.utcnow)
+    modified_by = me.StringField()
+    change_type = me.StringField(choices=['creation', 'status_update', 'assignment', 'rollback'])
 
 
 class Agent(me.Document):
@@ -150,31 +170,61 @@ class Agent(me.Document):
     agent_id = me.StringField(primary_key=True)
     label = me.StringField()
     department = me.StringField()
+    type = me.StringField(choices=['llm', 'dummy'], default='llm')
+    status = me.StringField(choices=['idle', 'busy', 'offline'], default='offline')
     capabilities = me.ListField(me.StringField())
-    status = me.StringField(choices=['idle', 'busy', 'offline', 'error'], default='idle')
     current_tickets = me.ListField(me.StringField())
     last_heartbeat = me.DateTimeField()
-    budget_rate_usd_per_hour = me.FloatField(default=0.10)
-    max_concurrent_tasks = me.IntField(default=2)
-    version = me.IntField(default=1)
+    last_processed_msg_id = me.StringField()
+    heartbeat_schedule = me.StringField()
+    budget_rate_usd_per_hour = me.FloatField(default=0.0)
+    max_concurrent_tasks = me.IntField(default=1)
     llm_config = me.DictField()
+    version = me.IntField(default=1)
 
     def to_dict(self):
         return {
-            '_id': str(self.agent_id),
+            '_id': self.agent_id,
+            'agent_id': self.agent_id,
             'label': self.label,
             'department': self.department,
-            'capabilities': self.capabilities,
+            'type': self.type,
             'status': self.status,
+            'capabilities': self.capabilities,
             'current_tickets': self.current_tickets,
             'last_heartbeat': self.last_heartbeat.isoformat() if self.last_heartbeat else None,
+            'budget_rate_usd_per_hour': self.budget_rate_usd_per_hour,
+            'max_concurrent_tasks': self.max_concurrent_tasks,
+        }
+
+
+class TicketType(me.Document):
+    meta = {'collection': 'ticket_types'}
+
+    id = me.StringField(primary_key=True) # e.g. ttype_logo
+    parent_id = me.StringField()
+    description = me.StringField()
+    required_assets = me.ListField(me.StringField())
+    required_capabilities = me.ListField(me.StringField())
+    template_parameters = me.DictField() # e.g. {'brand_name': {'type': 'string', 'required': True}}
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            '_id': self.id,
+            'parent_id': self.parent_id,
+            'description': self.description,
+            'required_assets': self.required_assets,
+            'required_capabilities': self.required_capabilities,
+            'template_parameters': self.template_parameters,
         }
 
 
 class Budget(me.Document):
     meta = {'collection': 'budgets'}
-    budget_id = me.StringField(primary_key=True)
-    type = me.StringField()
+    
+    _id = me.StringField(primary_key=True)
+    type = me.StringField(choices=['project', 'department'])
     allocated = me.FloatField(default=0.0)
     spent = me.FloatField(default=0.0)
     reserved = me.FloatField(default=0.0)
@@ -184,17 +234,20 @@ class Budget(me.Document):
 
 class MemoryVector(me.Document):
     meta = {'collection': 'memory_vectors'}
+    
     timestamp = me.DateTimeField(default=datetime.utcnow)
-    source_type = me.StringField()
+    source_type = me.StringField(choices=['ticket', 'conversation', 'audit'])
     source_id = me.StringField()
+    embedding = me.ListField(me.FloatField())
     text_summary = me.StringField()
     metadata = me.DictField()
 
 
 class Resource(me.Document):
-    meta = {'collection': 'resources'}
+    meta = {'collection': 'resources', 'indexes': ['project_id', 'department']}
+    
     name = me.StringField(required=True)
-    type = me.StringField()
+    type = me.StringField(choices=['image', 'document', 'code', 'data', 'video', 'audio'])
     format = me.StringField()
     gridfs_id = me.StringField()
     project_id = me.StringField()
@@ -203,12 +256,19 @@ class Resource(me.Document):
     description = me.StringField()
     created_by = me.StringField()
     created_at = me.DateTimeField(default=datetime.utcnow)
+    version = me.IntField(default=1)
+    checksum = me.StringField()
+    access_roles = me.ListField(me.StringField())
+    expires_at = me.DateTimeField()
+    embedding = me.ListField(me.FloatField())
 
     def to_dict(self):
         return {
             '_id': str(self.id),
             'name': self.name,
             'type': self.type,
+            'format': self.format,
+            'gridfs_id': self.gridfs_id,
             'project_id': self.project_id,
             'department': self.department,
             'tags': self.tags,
@@ -217,22 +277,58 @@ class Resource(me.Document):
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
 
+
+class ResourceRelationship(me.Document):
+    meta = {'collection': 'resource_relationships', 'indexes': ['source_id', 'target_id']}
+    
+    source_id = me.StringField(required=True)
+    target_id = me.StringField(required=True)
+    target_type = me.StringField(choices=['ticket', 'project', 'resource', 'agent'])
+    relation = me.StringField(choices=['used_in', 'derived_from', 'depends_on'])
+    created_at = me.DateTimeField(default=datetime.utcnow)
+
+
 class Company(me.Document):
     meta = {'collection': 'companies'}
+    
     name = me.StringField(required=True)
+    website = me.StringField()
+    email = me.StringField()
+    phone = me.StringField()
+    size = me.StringField()
     industry = me.StringField()
+    location = me.StringField()
+    scraped_at = me.DateTimeField()
+    source = me.StringField()
+    created_at = me.DateTimeField(default=datetime.utcnow)
+    stage = me.StringField()
     mission = me.StringField()
     vision = me.StringField()
-    stage = me.StringField()
-    created_at = me.DateTimeField(default=datetime.utcnow)
 
     def to_dict(self):
         return {
             '_id': str(self.id),
             'name': self.name,
+            'website': self.website,
             'industry': self.industry,
-            'mission': self.mission,
-            'vision': self.vision,
-            'stage': self.stage,
-            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class Person(me.Document):
+    meta = {'collection': 'people'}
+    
+    name = me.StringField(required=True)
+    email = me.StringField()
+    phone = me.StringField()
+    title = me.StringField()
+    company_id = me.StringField()
+    linkedin = me.StringField()
+    scraped_at = me.DateTimeField()
+
+    def to_dict(self):
+        return {
+            '_id': str(self.id),
+            'name': self.name,
+            'title': self.title,
+            'company_id': self.company_id,
         }

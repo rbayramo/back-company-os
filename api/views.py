@@ -1,14 +1,34 @@
 import json
-import uuid
 from datetime import datetime
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_http_methods
-from django.conf import settings
 from .models import Project, ConversationMessage, Ticket, Agent, AgentMessage, Company
+from .rabbitmq import publisher
+
+def format_log_message(msg_type, payload):
+    if not payload: return msg_type
+    if msg_type == 'human_message':
+        t = payload.get('text', '')
+        return f"Message sent to CEO: {t[:60]}..." if len(t) > 60 else f"Message sent to CEO: {t}"
+    if msg_type == 'ceo_response':
+        t = payload.get('text', '')
+        return f"{t[:60]}..." if len(t) > 60 else f"{t}"
+    if msg_type == 'ticket_approved': return "Project plan approved by user."
+    if msg_type == 'execute_task': return f"Working on ticket {payload.get('ticket_id')}"
+    if msg_type == 'budget_check_request': return f"Verifying budget for {payload.get('ticket_id')}"
+    if msg_type == 'budget_check_response': 
+        return f"Gatekeeper {'APPROVED' if payload.get('approved') else 'DENIED'} {payload.get('ticket_id')}"
+    if msg_type == 'audit_request': return f"Reviewing ticket {payload.get('ticket_id')}"
+    if msg_type == 'audit_result':
+        return f"Auditor {'APPROVED' if payload.get('approved') else 'REJECTED'} ticket {payload.get('ticket_id')}"
+    if msg_type == 'complete_ticket': return f"Worker successfully executed {payload.get('ticket_id')}"
+    if msg_type == 'register_agent': return f"Agent {payload.get('label', '')} booted into Swarm."
+    if msg_type == 'status_update': return f"Switched to {payload.get('status', 'idle').upper()} state."
+    if msg_type == 'agent_action': return payload.get('action', 'Agent performing action.')
+    if msg_type == 'ui_agent_status': return None
+    return f"Processed {msg_type}"
 
 # ─── Company ─────────────────────────────────────────────────────────────────
-
 @csrf_exempt
 def company_detail(request):
     """GET /api/company/ – get current company
@@ -25,7 +45,6 @@ def company_detail(request):
         except Exception:
             return JsonResponse({'error': 'Invalid JSON'}, status=400)
 
-        # Remove existing if any (since we only support ONE company)
         Company.objects.all().delete()
 
         company = Company(
@@ -41,47 +60,18 @@ def company_detail(request):
     return JsonResponse({'error': 'Method not allowed'}, status=405)
 
 
-def _get_company_context():
-    """Aggregate company and all missions into a single context string for the CEO."""
-    try:
-        from .models import Company, Project
-        company = Company.objects.first()
-        projects = Project.objects.all()
-        
-        ctx = ""
-        if company:
-            ctx += f"COMPANY: {company.name} ({company.industry})\n"
-            ctx += f"MISSION: {company.mission}\n"
-            ctx += f"VISION: {company.vision}\n\n"
-        
-        if projects:
-            ctx += "ALL MISSIONS/PROJECTS IN THIS COMPANY:\n"
-            for p in projects:
-                ctx += f"- {p.title} (Status: {p.status}): {p.goal or 'No goal set'}\n"
-        
-        return ctx
-    except Exception as e:
-        print(f"[_get_company_context] Error: {e}", flush=True)
-        return ""
-
-
 # ─── Projects ────────────────────────────────────────────────────────────────
-
 @csrf_exempt
 def projects_list(request):
     """GET /api/projects/ – list all projects
        POST /api/projects/ – create new project"""
-    try:
-        if request.method == 'GET':
-            projects = Project.objects.order_by('-created_at')
-            return JsonResponse([p.to_dict() for p in projects], safe=False)
-        
-        elif request.method == 'POST':
-            try:
-                data = json.loads(request.body)
-            except Exception:
-                return JsonResponse({'error': 'Invalid JSON'}, status=400)
-            
+    if request.method == 'GET':
+        projects = Project.objects.order_by('-created_at')
+        return JsonResponse([p.to_dict() for p in projects], safe=False)
+    
+    elif request.method == 'POST':
+        try:
+            data = json.loads(request.body)
             project = Project(
                 title=data.get('title', 'Untitled Project'),
                 description=data.get('description', ''),
@@ -89,15 +79,39 @@ def projects_list(request):
                 tags=data.get('tags', []),
             )
             project.save()
+            print(f"DEBUG: Saved project {project.id}")
             
-            # Note: Initial CEO welcome is now handled synchronously in messages_list (GET)
-            # when the frontend first fetches the conversation for this project.
-            
+            init_text = f"I have created a new startup mission: '{project.goal}'. Please review this and ask me questions to clarify the requirements."
+            human_msg = ConversationMessage(
+                project_id=str(project.id),
+                sender='human',
+                sender_id='board',
+                text=init_text,
+                processed=False,
+            )
+            human_msg.save()
+
+            payload = {
+                'project_id': str(project.id),
+                'conversation_message_id': str(human_msg.id),
+                'text': init_text,
+            }
+
+            try:
+                publisher.publish(
+                    sender='board',
+                    recipient='queue:agent:ceo',
+                    message_type='new_project_mission',
+                    payload=payload,
+                    project_id=str(project.id)
+                )
+            except Exception as pe:
+                print(f"DEBUG: Publisher failed but project saved: {pe}")
+
             return JsonResponse(project.to_dict(), status=201)
-    except Exception as e:
-        import traceback
-        print(f"[Views ERROR] projects_list: {traceback.format_exc()}", flush=True)
-        return JsonResponse({'error': str(e), 'traceback': traceback.format_exc()}, status=500)
+        except Exception as e:
+            print(f"ERROR creating project: {e}")
+            return JsonResponse({'error': str(e)}, status=500)
 
     return JsonResponse({'error': 'Method not allowed'}, status=405)
 
@@ -115,147 +129,193 @@ def project_detail(request, project_id):
 
     elif request.method == 'PATCH':
         data = json.loads(request.body)
-        for field in ['title', 'description', 'status', 'goal', 'tags']:
+        for field in ['title', 'description', 'status', 'goal', 'tags', 'auto_pilot']:
             if field in data:
                 setattr(project, field, data[field])
         project.updated_at = datetime.utcnow()
         project.save()
+
+        # If Auto Pilot was just turned ON, wake up the CEO to start planning
+        if data.get('auto_pilot') is True:
+            try:
+                from .publisher import Publisher
+                pub = Publisher()
+                pub.publish(
+                    sender='board',
+                    recipient='queue:agent:ceo',
+                    message_type='auto_pilot_enabled',
+                    payload={'text': 'Auto pilot enabled. Start mission execution.'},
+                    project_id=str(project.id)
+                )
+            except Exception as e:
+                print(f"[API] Failed to wake up CEO: {e}")
+
         return JsonResponse(project.to_dict())
 
     return JsonResponse({'error': 'Method not allowed'}, status=405)
 
 
 # ─── Messages ────────────────────────────────────────────────────────────────
-
 @csrf_exempt
 def messages_list(request, project_id):
-    """GET /api/projects/<id>/messages/ – get conversation
-       POST – send human message → queue to CEO"""
-    try:
-        if request.method == 'GET':
-            msgs = ConversationMessage.objects.filter(project_id=str(project_id)).order_by('timestamp')
-            
-            # Initial CEO trigger if no messages and project has goal
-            if not msgs:
-                try:
-                    # Handle possible missing project or invalid ID
-                    project = Project.objects.filter(id=project_id).first()
-                    if project and project.goal:
-                        print(f"[Views] First access to project {project_id}. Generating synchronous structured CEO response...", flush=True)
-                        from agents.ceo_agent import CEOAgent
-                        ceo = CEOAgent()
-                        
-                        # Get Global Context
-                        company_context = _get_company_context()
-                        full_prompt = ceo.get_system_prompt(company_context)
-                        
-                        user_prompt = f"Initial Project Setup Goal: {project.goal}"
-                        ai_raw = ceo.call_llm(full_prompt, user_prompt, json_mode=True)
-                        
-                        try:
-                            ai_json = json.loads(ai_raw)
-                            response_text = ai_json.get('response_text', f"Welcome! Let's work on: {project.goal}")
-                            suggested_tasks = ai_json.get('suggested_tasks', [])
-                        except Exception as e:
-                            print(f"[Views] Initial JSON parse failed: {e}", flush=True)
-                            response_text = ai_raw
-                            suggested_tasks = []
+    """GET /api/projects/<id>/messages/ – get conversation"""
+    if request.method == 'GET':
+        msgs = ConversationMessage.objects.filter(project_id=str(project_id)).order_by('timestamp')
+        return JsonResponse([m.to_dict() for m in msgs], safe=False)
+    elif request.method == 'POST':
+        return send_message(request, project_id)
+    return JsonResponse({'error': 'Method not allowed'}, status=405)
 
-                        ceo_msg = ConversationMessage(
-                            project_id=str(project_id),
-                            sender='ceo',
-                            text=response_text,
-                            processed=True,
-                        )
-                        ceo_msg.save()
-                        
-                        if suggested_tasks:
-                            ceo._draft_tickets(str(project_id), suggested_tasks)
-                            
-                        msgs = [ceo_msg]
-                except Exception as e:
-                    print(f"[Views] Error triggering initial CEO: {e}", flush=True)
 
-            return JsonResponse([m.to_dict() for m in msgs], safe=False)
+@csrf_exempt
+def send_message(request, project_id):
+    """POST /api/projects/<id>/send_message/ – send human message → queue to CEO"""
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+        except Exception:
+            return JsonResponse({'error': 'Invalid JSON'}, status=400)
 
-        elif request.method == 'POST':
+        text = data.get('text', '').strip()
+        if not text:
+            return JsonResponse({'error': 'text is required'}, status=400)
+
+        # 1. Save human message
+        human_msg = ConversationMessage(
+            project_id=str(project_id),
+            sender='human',
+            sender_id=data.get('sender_id', 'user'),
+            text=text,
+            processed=False,
+        )
+        human_msg.save()
+
+        # 2. Publish to RabbitMQ -> CEO
+        payload = {
+            'project_id': str(project_id),
+            'conversation_message_id': str(human_msg.id),
+            'text': text,
+        }
+        publisher.publish(
+            sender='board',
+            recipient='queue:agent:ceo',
+            message_type='human_message',
+            payload=payload,
+            project_id=str(project_id)
+        )
+
+        # 3. Broadcast instant live log visually to right sidebar
+        from channels.layers import get_channel_layer
+        from asgiref.sync import async_to_sync
+        channel_layer = get_channel_layer()
+        async_to_sync(channel_layer.group_send)(
+            f'project_{project_id}',
+            {
+                'type': 'agent_log_event',
+                'log': {
+                    'id': str(human_msg.id),
+                    'agent': 'board',
+                    'agent_label': 'BOARD',
+                    'message': format_log_message('human_message', payload),
+                    'timestamp': human_msg.timestamp.isoformat(),
+                    'type': 'info'
+                }
+            }
+        )
+
+        return JsonResponse({'message': 'Message queued successfully', 'data': human_msg.to_dict()}, status=201)
+    
+    return JsonResponse({'error': 'Method not allowed'}, status=405)
+
+
+@csrf_exempt
+def approve_plan(request, project_id):
+    """POST /api/projects/<id>/approve_plan/ – triggered by UI button to approve drafted tickets"""
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+        except Exception:
+            return JsonResponse({'error': 'Invalid JSON'}, status=400)
+
+        approved_tickets = data.get('approved_tickets', [])
+        message_id = data.get('message_id')
+        
+        # 1. Update the explicit tickets in DB instantly and send WebSocket + COO events
+        updated_count = 0
+        for tid in approved_tickets:
             try:
-                data = json.loads(request.body)
-            except Exception:
-                return JsonResponse({'error': 'Invalid JSON'}, status=400)
-
-            text = data.get('text', '').strip()
-            if not text:
-                return JsonResponse({'error': 'text is required'}, status=400)
-
-            # 1. Fetch History for Context
-            history_msgs = ConversationMessage.objects.filter(project_id=str(project_id)).order_by('-timestamp')[:15]
-            formatted_history = []
-            for m in reversed(history_msgs):
-                role = "user" if m.sender == 'human' else "assistant"
-                formatted_history.append({"role": role, "content": m.text or ""})
-
-            # 2. Save human message
-            human_msg = ConversationMessage(
-                project_id=str(project_id),
-                sender='human',
-                text=text,
-                processed=True,
-            )
-            human_msg.save()
-
-            # 3. Get CEO Agent and call synchronously
-            from agents.ceo_agent import CEOAgent
-            ceo = CEOAgent()
-            
-            # Get Global Context
-            company_context = _get_company_context()
-            full_prompt = ceo.get_system_prompt(company_context)
-            
-            try:
-                print(f"[Views] Calling CEOAgent (JSON Mode + History + Global Context) for project {project_id}...", flush=True)
-                ai_raw = ceo.call_llm(full_prompt, text, history=formatted_history, json_mode=True)
+                ticket = Ticket.objects.get(id=tid)
+                # Only update if draft exactly
+                if ticket.status == 'draft':
+                    ticket.status = 'open'
+                    ticket.save()
+                    updated_count += 1
                 
-                try:
-                    ai_json = json.loads(ai_raw)
-                    ceo_response_text = ai_json.get('response_text', "I've processed your message.")
-                    suggested_tasks = ai_json.get('suggested_tasks', [])
-                except Exception as e:
-                    print(f"[Views] Failed to parse CEO JSON: {e}", flush=True)
-                    ceo_response_text = ai_raw
-                    suggested_tasks = []
-
-                # 4. Save CEO response
-                ceo_msg = ConversationMessage(
-                    project_id=str(project_id),
-                    sender='ceo',
-                    text=ceo_response_text,
-                    processed=True,
+                # We need async_to_sync and channel_layer
+                from channels.layers import get_channel_layer
+                from asgiref.sync import async_to_sync
+                channel_layer = get_channel_layer()
+                async_to_sync(channel_layer.group_send)(
+                    f'project_{project_id}',
+                    {
+                        'type': 'kanban_update_event',
+                        'ticket': ticket.to_dict()
+                    }
                 )
-                ceo_msg.save()
-
-                # 5. Handle Suggested Tasks (create tickets)
-                if suggested_tasks:
-                    ceo._draft_tickets(str(project_id), suggested_tasks)
-
-                # 6. Return both
-                return JsonResponse({
-                    'human_message': human_msg.to_dict(),
-                    'ceo_message': ceo_msg.to_dict()
-                }, status=201)
+                
+                # Signal the COO directly to begin work
+                publisher.publish(
+                    sender='board',
+                    recipient='queue:agent:coo',
+                    message_type='create_ticket',
+                    payload={'ticket_id': tid},
+                    project_id=str(project_id),
+                    ticket_id=tid
+                )
             except Exception as e:
-                print(f"[Views] Error in CEO processing: {e}", flush=True)
-                return JsonResponse(human_msg.to_dict(), status=201)
-    except Exception as e:
-        import traceback
-        print(f"[Views ERROR] messages_list: {traceback.format_exc()}", flush=True)
-        return JsonResponse({'error': str(e), 'traceback': traceback.format_exc()}, status=500)
+                print(f"Error updating ticket {tid} in DB / WebSockets:", e)
+
+        # 2. Mark the explicit ConversationMessage as approved so UI freezes on refresh
+        if message_id:
+            try:
+                msg = ConversationMessage.objects.get(id=message_id)
+                if msg.structured_data:
+                    msg.structured_data['is_approved'] = True
+                    msg.save()
+            except Exception as e:
+                print("Error stamping message approval state:", e)
+
+        # 3. Save a human message indicating approval, just for context history
+        human_msg = ConversationMessage(
+            project_id=str(project_id),
+            sender='human',
+            text='I approve this plan. Please proceed.',
+            processed=False,
+        )
+        human_msg.save()
+
+        # Let the CEO know it was approved for context, but do NOT wait for it to process the tickets
+        payload = {
+            'project_id': str(project_id),
+            'approved_tickets': approved_tickets,
+            'conversation_message_id': str(human_msg.id)
+        }
+        publisher.publish(
+            sender='board',
+            recipient='queue:agent:ceo',
+            message_type='ticket_approved',
+            payload=payload,
+            project_id=str(project_id)
+        )
+
+        return JsonResponse({'message': 'Plan approved effectively', 'updated': updated_count})
+
+        return JsonResponse({'message': 'Plan approved and queued.'}, status=200)
 
     return JsonResponse({'error': 'Method not allowed'}, status=405)
 
 
 # ─── Tickets / Kanban ─────────────────────────────────────────────────────────
-
 def tickets_list(request, project_id):
     """GET /api/projects/<id>/tickets/"""
     tickets = Ticket.objects.filter(project_id=project_id).order_by('-created_at')
@@ -264,7 +324,7 @@ def tickets_list(request, project_id):
 
 @csrf_exempt
 def ticket_detail(request, project_id, ticket_id):
-    """PATCH /api/projects/<id>/tickets/<tid>/"""
+    """GET/PATCH/DELETE /api/projects/<id>/tickets/<tid>/"""
     try:
         ticket = Ticket.objects.get(id=ticket_id, project_id=project_id)
     except Exception:
@@ -273,21 +333,61 @@ def ticket_detail(request, project_id, ticket_id):
     if request.method == 'GET':
         return JsonResponse(ticket.to_dict())
 
-    elif request.method == 'PATCH':
+    elif request.method == 'PATCH' or request.method == 'PUT':
         data = json.loads(request.body)
-        for field in ['status', 'priority', 'assigned_to', 'description', 'tags']:
+        for field in ['title', 'status', 'priority', 'assigned_to', 'description', 'tags']:
             if field in data:
                 setattr(ticket, field, data[field])
         ticket.updated_at = datetime.utcnow()
         ticket.version += 1
         ticket.save()
+        
+        # Broadcast update
+        from channels.layers import get_channel_layer
+        from asgiref.sync import async_to_sync
+        channel_layer = get_channel_layer()
+        async_to_sync(channel_layer.group_send)(
+            f'project_{project_id}',
+            {
+                'type': 'kanban_update_event',
+                'ticket': ticket.to_dict()
+            }
+        )
         return JsonResponse(ticket.to_dict())
+
+    elif request.method == 'DELETE':
+        # 1. Prune from ConversationMessage drafts if it exists
+        try:
+            msgs = ConversationMessage.objects(project_id=project_id, structured_data__drafted_ticket_ids=ticket_id)
+            for m in msgs:
+                if m.structured_data and 'drafted_ticket_ids' in m.structured_data:
+                    m.structured_data['drafted_ticket_ids'] = [tid for tid in m.structured_data['drafted_ticket_ids'] if tid != ticket_id]
+                    m.save()
+        except Exception as e:
+            print(f"Error pruning ticket {ticket_id} from messages: {e}")
+
+        # 2. Delete the ticket
+        ticket_data = ticket.to_dict()
+        ticket_data['status'] = 'deleted' # Signal deletion to frontend
+        ticket.delete()
+
+        # 3. Broadcast deletion
+        from channels.layers import get_channel_layer
+        from asgiref.sync import async_to_sync
+        channel_layer = get_channel_layer()
+        async_to_sync(channel_layer.group_send)(
+            f'project_{project_id}',
+            {
+                'type': 'kanban_update_event',
+                'ticket': ticket_data
+            }
+        )
+        return JsonResponse({'message': 'Deleted successfully'})
 
     return JsonResponse({'error': 'Method not allowed'}, status=405)
 
 
 # ─── Agents ──────────────────────────────────────────────────────────────────
-
 def agents_list(request):
     """GET /api/agents/"""
     agents = Agent.objects.all()
@@ -295,50 +395,23 @@ def agents_list(request):
 
 
 # ─── Logs ────────────────────────────────────────────────────────────────────
-
 def logs_list(request, project_id):
     """GET /api/projects/<id>/logs/"""
     msgs = AgentMessage.objects.filter(project_id=project_id).order_by('-timestamp')[:200]
     result = []
     for m in msgs:
+        sender_raw = m.sender or 'system'
+        agent_id = sender_raw.replace('agent:', '')
+        label = agent_id.upper()
+        if agent_id in ['django', 'board', 'user', 'human']:
+            label = 'BOARD'
+        
         result.append({
             'id': str(m.id),
-            'agent': m.sender.replace('agent:', '') if m.sender else 'system',
-            'agent_label': m.sender.replace('agent:', '').upper() if m.sender else 'System',
-            'message': f"[{m.message_type}] {json.dumps(m.payload)[:120]}" if m.payload else m.message_type,
+            'agent': agent_id,
+            'agent_label': label,
+            'message': format_log_message(m.message_type, m.payload),
             'timestamp': m.timestamp.isoformat() if m.timestamp else None,
             'type': 'info',
         })
     return JsonResponse(list(reversed(result)), safe=False)
-
-
-# ─── CEO Queue Publisher ──────────────────────────────────────────────────────
-
-def _publish_to_ceo(project, text, msg_id=None):
-    """Publish a human_message to the CEO agent task queue."""
-    print(f"[Views] Queuing message for CEO: {text[:50]}...", flush=True)
-    # 1. Create AgentMessage in MongoDB (Acts as the queue)
-    msg = AgentMessage(
-        message_id=f'task_{uuid.uuid4().hex[:8]}',
-        timestamp=datetime.utcnow(),
-        message_type='human_message',
-        sender='human',
-        recipient='agent:ceo',
-        project_id=str(project.id),
-        payload={
-            'project_id': str(project.id),
-            'conversation_message_id': msg_id or '',
-            'text': text,
-        },
-        processed=False
-    )
-    msg.save()
-
-    # 2. Optionally notify via Redis (as a speed-up if available)
-    try:
-        import redis
-        import os
-        r = redis.from_url(os.environ.get('REDIS_URL', 'redis://localhost:6379/0'))
-        r.rpush('queue:agent:ceo', json.dumps(msg.to_dict()))
-    except:
-        pass

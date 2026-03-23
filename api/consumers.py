@@ -11,6 +11,11 @@ class ProjectConsumer(AsyncWebsocketConsumer):
             self.room_group_name,
             self.channel_name
         )
+        # Join global agents group
+        await self.channel_layer.group_add(
+            'global_agents',
+            self.channel_name
+        )
 
         await self.accept()
 
@@ -18,6 +23,10 @@ class ProjectConsumer(AsyncWebsocketConsumer):
         # Leave project group
         await self.channel_layer.group_discard(
             self.room_group_name,
+            self.channel_name
+        )
+        await self.channel_layer.group_discard(
+            'global_agents',
             self.channel_name
         )
 
@@ -47,4 +56,11 @@ class ProjectConsumer(AsyncWebsocketConsumer):
         await self.send(text_data=json.dumps({
             'type': 'agent_log',
             'log': event['log']
+        }))
+
+    async def agent_status_event(self, event):
+        """Handler for 'type': 'agent_status_event'"""
+        await self.send(text_data=json.dumps({
+            'type': 'agent_status',
+            'agent': event['agent']
         }))
