@@ -19,9 +19,9 @@ MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017/agent_swarm_os')
 MONGO_DB_NAME = os.getenv('MONGO_DB_NAME', 'agent_swarm_os')
 
 DEFAULT_LLM_CONFIG = {
-    "api_key": "sk-b54c3d7ff2b74091ba000df440388d85",
+    "api_key": os.getenv('DEEPSEEK_API_KEY'),
     "api_key_name": "DEEPSEEK_API_KEY",
-    "model": "deepseek-reasoner"
+    "model": os.getenv('DEEPSEEK_MODEL')
 }
 
 def seed():
