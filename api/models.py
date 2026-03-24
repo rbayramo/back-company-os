@@ -179,6 +179,7 @@ class Agent(me.Document):
     heartbeat_schedule = me.StringField()
     budget_rate_usd_per_hour = me.FloatField(default=0.0)
     max_concurrent_tasks = me.IntField(default=1)
+    is_active = me.BooleanField(default=True)
     llm_config = me.DictField()
     version = me.IntField(default=1)
 
@@ -190,11 +191,13 @@ class Agent(me.Document):
             'department': self.department,
             'type': self.type,
             'status': self.status,
+            'is_active': self.is_active,
             'capabilities': self.capabilities,
             'current_tickets': self.current_tickets,
             'last_heartbeat': self.last_heartbeat.isoformat() if self.last_heartbeat else None,
             'budget_rate_usd_per_hour': self.budget_rate_usd_per_hour,
             'max_concurrent_tasks': self.max_concurrent_tasks,
+            'llm_config': self.llm_config,
         }
 
 
@@ -207,6 +210,8 @@ class TicketType(me.Document):
     required_assets = me.ListField(me.StringField())
     required_capabilities = me.ListField(me.StringField())
     template_parameters = me.DictField() # e.g. {'brand_name': {'type': 'string', 'required': True}}
+    system_instructions = me.StringField(default='') # Global 'HOW-TO' for this blueprint
+    audit_failure_count = me.IntField(default=0) # Track global failures for self-healing
 
     def to_dict(self):
         return {
@@ -217,6 +222,30 @@ class TicketType(me.Document):
             'required_assets': self.required_assets,
             'required_capabilities': self.required_capabilities,
             'template_parameters': self.template_parameters,
+            'system_instructions': self.system_instructions,
+            'audit_failure_count': self.audit_failure_count,
+        }
+
+
+class KnowledgeExperience(me.Document):
+    meta = {'collection': 'knowledge_experience', 'indexes': ['ttype_id', 'context_tags']}
+
+    ttype_id = me.StringField(required=True)
+    task_goal = me.StringField()
+    best_practice_output = me.StringField() # The 'Gold' snippet
+    context_tags = me.ListField(me.StringField())
+    embedding = me.ListField(me.FloatField()) # For semantic retrieval
+    created_at = me.DateTimeField(default=datetime.utcnow)
+    success_rating = me.IntField(default=1) # Incremented if reused successfully
+
+    def to_dict(self):
+        return {
+            'id': str(self.id),
+            'ttype_id': self.ttype_id,
+            'task_goal': self.task_goal,
+            'best_practice_output': self.best_practice_output,
+            'context_tags': self.context_tags,
+            'success_rating': self.success_rating
         }
 
 

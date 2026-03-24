@@ -20,6 +20,7 @@ urlpatterns = [
 
     # Agents
     path('agents/', views.agents_list, name='agents_list'),
+    path('agents/<str:agent_id>/', views.agent_detail, name='agent_detail'),
 
     # Activity Logs
     path('projects/<str:project_id>/logs/', views.logs_list, name='logs_list'),

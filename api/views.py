@@ -138,9 +138,7 @@ def project_detail(request, project_id):
         # If Auto Pilot was just turned ON, wake up the CEO to start planning
         if data.get('auto_pilot') is True:
             try:
-                from .publisher import Publisher
-                pub = Publisher()
-                pub.publish(
+                publisher.publish(
                     sender='board',
                     recipient='queue:agent:ceo',
                     message_type='auto_pilot_enabled',
@@ -392,6 +390,59 @@ def agents_list(request):
     """GET /api/agents/"""
     agents = Agent.objects.all()
     return JsonResponse([a.to_dict() for a in agents], safe=False)
+
+
+@csrf_exempt
+def agent_detail(request, agent_id):
+    """GET/PATCH /api/agents/<agent_id>/"""
+    try:
+        agent = Agent.objects.get(agent_id=agent_id)
+    except Exception:
+        return JsonResponse({'error': 'Not found'}, status=404)
+
+    if request.method == 'GET':
+        return JsonResponse(agent.to_dict())
+
+    elif request.method == 'PATCH':
+        try:
+            data = json.loads(request.body)
+            # updateable fields
+            if 'label' in data: agent.label = data['label']
+            if 'is_active' in data: agent.is_active = data['is_active']
+            if 'budget_rate_usd_per_hour' in data: 
+                agent.budget_rate_usd_per_hour = float(data['budget_rate_usd_per_hour'])
+            if 'max_concurrent_tasks' in data:
+                agent.max_concurrent_tasks = int(data['max_concurrent_tasks'])
+            if 'llm_config' in data:
+                if isinstance(data['llm_config'], dict):
+                    # Merge instead of overwrite
+                    new_config = agent.llm_config or {}
+                    for k, v in data['llm_config'].items():
+                        if v: # Only update if non-empty (esp for api_key)
+                            new_config[k] = v
+                    agent.llm_config = new_config
+                else:
+                    agent.llm_config = data['llm_config']
+            
+            agent.save()
+
+            # Broadcast status update if is_active changed
+            from channels.layers import get_channel_layer
+            from asgiref.sync import async_to_sync
+            channel_layer = get_channel_layer()
+            async_to_sync(channel_layer.group_send)(
+                'global_agents',
+                {
+                    'type': 'agent_status_event',
+                    'agent': agent.to_dict()
+                }
+            )
+
+            return JsonResponse(agent.to_dict())
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=400)
+
+    return JsonResponse({'error': 'Method not allowed'}, status=405)
 
 
 # ─── Logs ────────────────────────────────────────────────────────────────────
