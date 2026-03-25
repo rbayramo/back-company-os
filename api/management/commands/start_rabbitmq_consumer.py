@@ -65,6 +65,7 @@ class Command(BaseCommand):
 
                 # Broadcast agent status to all active UI clients globally
                 if msg_type == 'ui_agent_status':
+                    # Send to global group for sidebar updates
                     async_to_sync(channel_layer.group_send)(
                         'global_agents',
                         {
@@ -72,6 +73,15 @@ class Command(BaseCommand):
                             'agent': payload
                         }
                     )
+                    # Also send to project group for chat typing isolation
+                    if project_id:
+                        async_to_sync(channel_layer.group_send)(
+                            f'project_{project_id}',
+                            {
+                                'type': 'agent_status_event',
+                                'agent': payload
+                            }
+                        )
 
                 # Broadcast via Websockets if project_id exists
                 if project_id:

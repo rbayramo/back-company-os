@@ -7,6 +7,16 @@ from .rabbitmq import publisher
 
 def format_log_message(msg_type, payload):
     if not payload: return msg_type
+    
+    ticket_title = payload.get('ticket_title')
+    project_title = payload.get('project_title')
+    status = payload.get('status', '').upper()
+    old_status = payload.get('old_status', '').upper()
+    
+    # Context should NEVER show ID if title is available.
+    # If no title, use "Unknown Task", but avoid raw UUIDs in the UI.
+    context = f": '{ticket_title}'" if ticket_title else ""
+
     if msg_type == 'human_message':
         t = payload.get('text', '')
         return f"Message sent to CEO: {t[:60]}..." if len(t) > 60 else f"Message sent to CEO: {t}"
@@ -14,17 +24,30 @@ def format_log_message(msg_type, payload):
         t = payload.get('text', '')
         return f"{t[:60]}..." if len(t) > 60 else f"{t}"
     if msg_type == 'ticket_approved': return "Project plan approved by user."
-    if msg_type == 'execute_task': return f"Working on ticket {payload.get('ticket_id')}"
-    if msg_type == 'budget_check_request': return f"Verifying budget for {payload.get('ticket_id')}"
+    if msg_type == 'execute_task': return f"Working on ticket{context}"
+    if msg_type == 'budget_check_request': return f"Verifying budget for{context}"
     if msg_type == 'budget_check_response': 
-        return f"Gatekeeper {'APPROVED' if payload.get('approved') else 'DENIED'} {payload.get('ticket_id')}"
-    if msg_type == 'audit_request': return f"Reviewing ticket {payload.get('ticket_id')}"
+        return f"Gatekeeper {'APPROVED' if payload.get('approved') else 'DENIED'} ticket{context}"
+    if msg_type == 'audit_request': return f"Reviewing ticket{context}"
     if msg_type == 'audit_result':
-        return f"Auditor {'APPROVED' if payload.get('approved') else 'REJECTED'} ticket {payload.get('ticket_id')}"
-    if msg_type == 'complete_ticket': return f"Worker successfully executed {payload.get('ticket_id')}"
+        return f"Auditor {'APPROVED' if payload.get('approved') else 'REJECTED'} ticket{context}"
+    if msg_type == 'complete_ticket': return f"Worker successfully executed ticket{context}"
     if msg_type == 'register_agent': return f"Agent {payload.get('label', '')} booted into Swarm."
-    if msg_type == 'status_update': return f"Switched to {payload.get('status', 'idle').upper()} state."
+    if msg_type == 'status_update': return f"Switched to {status} state."
     if msg_type == 'agent_action': return payload.get('action', 'Agent performing action.')
+    
+    if msg_type == 'ticket_updated':
+        if old_status and status:
+            return f"Ticket{context} changed from {old_status} to {status}"
+        return f"Ticket{context} updated to {status}"
+    
+    if msg_type == 'project_updated':
+        p_name = project_title or "Project"
+        return f"Project '{p_name}' status changed to {status}"
+    
+    if msg_type == 'new_project_mission':
+        return f"New startup mission received: '{payload.get('goal', 'Untitled')}'"
+
     if msg_type == 'ui_agent_status': return None
     return f"Processed {msg_type}"
 
@@ -77,6 +100,7 @@ def projects_list(request):
                 description=data.get('description', ''),
                 goal=data.get('goal', ''),
                 tags=data.get('tags', []),
+                auto_pilot=data.get('auto_pilot', False),
             )
             project.save()
             print(f"DEBUG: Saved project {project.id}")
@@ -90,6 +114,27 @@ def projects_list(request):
                 processed=False,
             )
             human_msg.save()
+
+            # Immediate UI Logging
+            try:
+                # Board Log
+                publisher.publish(
+                    sender='board',
+                    recipient='queue:django',
+                    message_type='agent_action',
+                    payload={'action': 'New mission submitted to the CEO.'},
+                    project_id=str(project.id)
+                )
+                # CEO Log
+                publisher.publish(
+                    sender='ceo',
+                    recipient='queue:django',
+                    message_type='agent_action',
+                    payload={'action': 'CEO received the mission and started planning.'},
+                    project_id=str(project.id)
+                )
+            except Exception as le:
+                print(f"DEBUG: Initial logging failed: {le}")
 
             payload = {
                 'project_id': str(project.id),
@@ -266,9 +311,10 @@ def approve_plan(request, project_id):
                     sender='board',
                     recipient='queue:agent:coo',
                     message_type='create_ticket',
-                    payload={'ticket_id': tid},
+                    payload={'ticket_id': tid, 'ticket_title': ticket.title},
                     project_id=str(project_id),
-                    ticket_id=tid
+                    ticket_id=tid,
+                    ticket_title=ticket.title
                 )
             except Exception as e:
                 print(f"Error updating ticket {tid} in DB / WebSockets:", e)

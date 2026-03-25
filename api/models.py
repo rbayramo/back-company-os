@@ -182,6 +182,7 @@ class Agent(me.Document):
     is_active = me.BooleanField(default=True)
     llm_config = me.DictField()
     version = me.IntField(default=1)
+    current_project_id = me.StringField()
 
     def to_dict(self):
         return {
@@ -198,6 +199,7 @@ class Agent(me.Document):
             'budget_rate_usd_per_hour': self.budget_rate_usd_per_hour,
             'max_concurrent_tasks': self.max_concurrent_tasks,
             'llm_config': self.llm_config,
+            'current_project_id': self.current_project_id,
         }
 
 
