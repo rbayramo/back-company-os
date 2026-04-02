@@ -65,6 +65,7 @@ class Command(BaseCommand):
 
                 # Broadcast agent status to all active UI clients globally
                 if msg_type == 'ui_agent_status':
+                    print(f"[Consumer] Broadcasting UI Status: {payload.get('agent_id')} -> {payload.get('status')} on project {project_id}")
                     # Send to global group for sidebar updates
                     async_to_sync(channel_layer.group_send)(
                         'global_agents',
@@ -88,6 +89,7 @@ class Command(BaseCommand):
                     room_group_name = f'project_{project_id}'
                     
                     if msg_type == 'ceo_response':
+                        print(f"[Consumer] Broadcasting CEO Response to {room_group_name}")
                         async_to_sync(channel_layer.group_send)(
                             room_group_name,
                             {
